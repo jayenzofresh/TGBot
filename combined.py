@@ -28,6 +28,15 @@ except ImportError:
         print(f"Failed to install Telethon: {e}")
         sys.exit(1)
 
+try:
+    import requests
+except ImportError:
+    import subprocess
+    import sys
+    print("requests not found. Installing...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
+
 import asyncio
 import json
 import logging
@@ -43,7 +52,30 @@ from typing import Dict, Optional, Tuple, Any, List
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 
-from telethon import TelegramClient, errors
+VERSION = "1.0.0"
+UPDATE_URL = "https://raw.githubusercontent.com/jayenzofresh/TGBot/main/combined.py"
+
+def check_for_updates():
+    try:
+        response = requests.get(UPDATE_URL, timeout=10)
+        if response.status_code == 200:
+            content = response.text
+            latest_version_line = None
+            for line in content.split('\n'):
+                if line.startswith('VERSION = '):
+                    latest_version_line = line.strip()
+                    break
+            current_version_line = f'VERSION = "{VERSION}"'
+            if latest_version_line and latest_version_line != current_version_line:
+                if messagebox.askyesno('Update Available', 'A new version is available. Update now?'):
+                    with open(__file__, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    messagebox.showinfo('Updated', 'Script updated. Please restart the application.')
+                    sys.exit(0)
+    except Exception as e:
+        print(f"Update check failed: {e}")
+
+from telethon import TelegramClient, errors, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat
@@ -127,6 +159,17 @@ class DBManager:
                     group_title TEXT PRIMARY KEY,
                     last_message_id INTEGER,
                     ts TEXT
+                )"""
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS queued_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER,
+                    message_id INTEGER,
+                    target_ids TEXT,
+                    options TEXT,
+                    enqueued_at TEXT
                 )"""
             )
             conn.execute(
@@ -361,10 +404,12 @@ async def _async_delete_forwarded_in_groups(client: TelegramClient, group_list: 
 # Section 2: ForwardEngine
 # -------------------------
 class ForwardEngine:
-    def __init__(self, client: TelegramClient, dbm: DBManager, history_obj=None, defaults=None):
+    def __init__(self, client: TelegramClient, dbm: DBManager, history_obj=None, defaults=None, source_entity=None, target_entities=None):
         self.client = client
         self.db = dbm
         self.history = history_obj
+        self.source_entity = source_entity
+        self.target_entities = target_entities or []
         if defaults is None:
             self.defaults = {
                 "batch_size": int(self.db.get_setting("batch_size", "10")),
@@ -382,6 +427,7 @@ class ForwardEngine:
         self.queue: "Queue[Tuple]" = Queue(maxsize=MSG_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Future] = None
         self._running = False
+        self._handler = None
 
     def _load_last_sent_from_db(self):
         try:
@@ -526,16 +572,59 @@ class ForwardEngine:
             logger.exception("Unexpected error forwarding to %s: %s", title, e)
             return False, None
 
-    def enqueue(self, source_entity, message_obj, target_entities: List, options: Dict = None):
+    def enqueue(self, source_entity, message_obj, target_entities: List, options: Dict = None, persist: bool = True):
         if options is None:
             options = {}
+        source_id = getattr(source_entity, 'id', None)
+        message_id = getattr(message_obj, 'id', None)
+        target_ids = [getattr(t, 'id', None) for t in target_entities]
+        if persist:
+            # Check if already queued
+            rows = self.db.query("SELECT 1 FROM queued_messages WHERE source_id=? AND message_id=? LIMIT 1", (source_id, message_id))
+            if rows:
+                logger.debug("Message %s already queued", message_id)
+                return False
+            try:
+                self.db.execute("INSERT INTO queued_messages (source_id, message_id, target_ids, options, enqueued_at) VALUES (?, ?, ?, ?, ?)",
+                                (source_id, message_id, json.dumps(target_ids), json.dumps(options), datetime.now().isoformat()))
+            except Exception:
+                logger.exception("Failed to persist queued message")
+                return False
         try:
             self.queue.put_nowait((source_entity, message_obj, target_entities, options))
-            logger.debug("Enqueued message %s for %d targets", getattr(message_obj, 'id', None), len(target_entities))
+            logger.debug("Enqueued message %s for %d targets", message_id, len(target_entities))
             return True
         except Exception:
             logger.exception("Queue full or unavailable")
             return False
+
+    async def load_queued(self):
+        rows = self.db.query("SELECT source_id, message_id, target_ids, options FROM queued_messages")
+        for row in rows:
+            source_id, message_id, target_ids_str, options_str = row
+            try:
+                source_ent = await self.client.get_entity(source_id)
+                message_obj = await self.client.get_messages(source_ent, ids=message_id)
+                if not message_obj:
+                    continue
+                target_ids = json.loads(target_ids_str)
+                target_ents = []
+                for tid in target_ids:
+                    try:
+                        tent = await self.client.get_entity(tid)
+                        target_ents.append(tent)
+                    except Exception:
+                        logger.exception("Failed to get target entity %s", tid)
+                options = json.loads(options_str) if options_str else {}
+                self.enqueue(source_ent, message_obj, target_ents, options, persist=False)
+            except Exception as e:
+                logger.exception("Error loading queued message %s", message_id)
+        self.db.execute("DELETE FROM queued_messages")
+
+    async def _on_new_message(self, event):
+        message = event.message
+        # Enqueue the new message for forwarding
+        self.enqueue(self.source_entity, message, self.target_entities, {})
 
     async def _worker(self):
         logger.info("ForwardEngine worker started")
@@ -577,10 +666,14 @@ class ForwardEngine:
         if self._running:
             return
         self._running = True
+        self._handler = self.client.add_event_handler(events.NewMessage, self._on_new_message)
         loop = loop or asyncio.get_event_loop()
         self._worker_task = loop.create_task(self._worker())
 
     def stop(self):
+        if self._handler:
+            self.client.remove_event_handler(self._handler)
+            self._handler = None
         self._running = False
         if self._worker_task:
             try:
@@ -596,17 +689,33 @@ class TelegramForwarderApp:
     def __init__(self):
         self.account_mgr = account_mgr
         self.db = db
-        self.forward_engine: Optional[ForwardEngine] = None
+        self.forward_engines: Dict[str, ForwardEngine] = {}
 
         self.current_phone: Optional[str] = None
         self.current_client: Optional[TelegramClient] = None
         self.current_user_id: Optional[int] = None
         self.group_list: List[Tuple[Any, str]] = []
+        self.forward_queued_on_start = False
 
         self.root = tk.Tk()
         self.root.title("Telegram Forwarder — Rebuilt")
         self._build_ui()
         self._tick_animation()
+
+        # Check for queued messages on startup
+        rows = self.db.query("SELECT COUNT(*) FROM queued_messages")
+        count = rows[0][0] if rows else 0
+        if count > 0:
+            if messagebox.askyesno('Queued Messages', f'There are {count} queued messages from previous session. Do you want to forward them?'):
+                self.forward_queued_on_start = True
+            else:
+                self.db.execute("DELETE FROM queued_messages")
+                self.forward_queued_on_start = False
+        else:
+            self.forward_queued_on_start = False
+
+        # Check for updates on startup
+        check_for_updates()
 
         # Start asyncio loop in a separate thread
         self.loop = asyncio.new_event_loop()
@@ -853,31 +962,46 @@ class TelegramForwarderApp:
         if not self.current_client:
             messagebox.showerror('Not connected', 'Switch to an account and login first')
             return
-        if self.forward_engine and self.forward_engine._running:
+        if self.current_phone in self.forward_engines and self.forward_engines[self.current_phone]._running:
             messagebox.showinfo('Already running', 'Forwarding already running')
             return
+        sel = self.source_listbox.curselection()
+        tsel = self.target_listbox.curselection()
+        if not sel or not tsel:
+            messagebox.showerror('Select', 'Select a source and at least one target')
+            return
+        # Save selections to DB
+        source_title = self.group_list[sel[0]][1]
+        target_titles = [self.group_list[i][1] for i in tsel]
+        self.db.set_setting("last_source_title", source_title)
+        self.db.set_setting("last_target_titles", json.dumps(target_titles))
+        source_ent = self.group_list[sel[0]][0]
+        targets = [self.group_list[i][0] for i in tsel]
         async def start_eng():
             if not self.current_client.is_connected():
                 await self.current_client.connect()
-            eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None)
+            eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None, source_entity=source_ent, target_entities=targets)
             eng.start(self.loop)
+            if self.forward_queued_on_start:
+                await eng.load_queued()
+                self.forward_queued_on_start = False
             return eng
         def cb(res, exc):
             if exc:
                 self.log(f"Failed to start engine: {exc}")
                 messagebox.showerror('Error', str(exc))
                 return
-            self.forward_engine = res
+            self.forward_engines[self.current_phone] = res
             self.log('Forwarding started')
             messagebox.showinfo('Started', 'Forwarding engine started')
         self.schedule_coro(start_eng(), ui_callback=cb)
 
     def on_stop_forwarding(self):
-        if not self.forward_engine:
+        if self.current_phone not in self.forward_engines or not self.forward_engines[self.current_phone]._running:
             messagebox.showinfo('Not running', 'Forwarding engine is not running')
             return
-        self.forward_engine.stop()
-        self.forward_engine = None
+        self.forward_engines[self.current_phone].stop()
+        del self.forward_engines[self.current_phone]
         self.log('Forwarding stopped')
         messagebox.showinfo('Stopped', 'Forwarding engine stopped')
 
@@ -910,11 +1034,11 @@ class TelegramForwarderApp:
                         continue
                     if attach_only and not getattr(m, 'media', None):
                         continue
-                    if not self.forward_engine:
+                    if self.current_phone not in self.forward_engines or not self.forward_engines[self.current_phone]._running:
                         eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None)
                         eng.start(self.loop)
-                        self.forward_engine = eng
-                    ok = self.forward_engine.enqueue(source_ent, m, targets, { 'batch_size': self.forward_engine.defaults.get('batch_size', 6), 'cooldown_minutes': self.forward_engine.defaults.get('cooldown_minutes', 1) })
+                        self.forward_engines[self.current_phone] = eng
+                    ok = self.forward_engines[self.current_phone].enqueue(source_ent, m, targets, { 'batch_size': self.forward_engines[self.current_phone].defaults.get('batch_size', 6), 'cooldown_minutes': self.forward_engines[self.current_phone].defaults.get('cooldown_minutes', 1) })
                     if ok:
                         count += 1
                     if count >= MSG_QUEUE_MAXSIZE:
@@ -1053,8 +1177,8 @@ class TelegramForwarderApp:
         try:
             self.root.mainloop()
         finally:
-            if self.forward_engine:
-                self.forward_engine.stop()
+            for eng in self.forward_engines.values():
+                eng.stop()
             self.log('Shutdown complete')
 
 # -------------------------
