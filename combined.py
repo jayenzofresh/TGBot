@@ -857,7 +857,7 @@ class TelegramForwarderApp:
             messagebox.showinfo('Already running', 'Forwarding already running')
             return
         async def start_eng():
-            if not await self.current_client.is_connected():
+            if not self.current_client.is_connected():
                 await self.current_client.connect()
             eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None)
             eng.start(self.loop)
@@ -904,7 +904,7 @@ class TelegramForwarderApp:
             try:
                 count = 0
                 async for m in self.current_client.iter_messages(source_ent, limit=100):
-                    if self.current_user_id is not None and getattr(m, 'sender_id', None) != self.current_user_id:
+                    if not isinstance(source_ent, Channel) and self.current_user_id is not None and getattr(m, 'sender_id', None) != self.current_user_id:
                         continue
                     if kw and (not getattr(m, 'text', '') or kw.lower() not in getattr(m, 'text', '').lower()):
                         continue
