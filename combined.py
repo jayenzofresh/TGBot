@@ -17,12 +17,25 @@ Note: This script will automatically install Telethon if not present.
 # Check and install Telethon if not present
 try:
     import telethon
+    # Check version
+    from telethon import __version__ as telethon_version
+    required_version = "1.28.0"
+    if telethon_version < required_version:
+        print(f"Telethon version {telethon_version} is too old. Installing newer version...")
+        import subprocess
+        import sys
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "telethon>=1.28,<1.32"])
+            print("Telethon updated successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to update Telethon: {e}")
+            sys.exit(1)
 except ImportError:
     import subprocess
     import sys
     print("Telethon not found. Installing...")
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "telethon"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "telethon>=1.28,<1.32"])
         print("Telethon installed successfully.")
     except subprocess.CalledProcessError as e:
         print(f"Failed to install Telethon: {e}")
@@ -40,13 +53,14 @@ except ImportError:
 import asyncio
 import json
 import logging
+import random
 import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-from queue import Queue
+# from queue import Queue  # Removed for asyncio.Queue
 from typing import Dict, Optional, Tuple, Any, List
 
 import tkinter as tk
@@ -179,6 +193,15 @@ class DBManager:
                     value TEXT
                 )"""
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS compliance_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT,
+                    event_type TEXT,
+                    details TEXT
+                )"""
+            )
         conn.close()
 
     def execute(self, sql: str, params: Tuple = ()):
@@ -241,6 +264,90 @@ class ForwardingStatistics:
 
     def snapshot(self):
         return {"forwarded": dict(self._forwards), "deleted": dict(self._deletes)}
+
+# -------------------------
+# Compliance Manager
+# -------------------------
+class ComplianceManager:
+    """
+    Manages compliance checks for message forwarding, including content validation,
+    rate limiting, logging violations, and alerting.
+    """
+    def __init__(self, dbm: DBManager, gui_app=None):
+        self.db = dbm
+        self.gui_app = gui_app  # For alerts
+        self.enable_compliance = self.db.get_setting("enable_compliance", "1") == "1"
+        self.enable_content_validation = self.db.get_setting("enable_content_validation", "1") == "1"
+        self.global_rate_limit_per_minute = int(self.db.get_setting("global_rate_limit_per_minute", "20"))
+        # In-memory rate tracking: user_id -> deque of timestamps
+        self._rate_tracking: Dict[int, deque] = defaultdict(lambda: deque(maxlen=100))
+
+    def validate_content(self, message) -> bool:
+        """
+        Validate message content for spam/abusive behavior.
+        Returns True if compliant, False otherwise.
+        """
+        if not self.enable_content_validation:
+            return True
+        text = getattr(message, 'text', '') or ''
+        # Simple checks: length, keywords
+        if len(text) > 4096:  # Telegram message limit
+            return False
+        spam_keywords = ['spam', 'scam', 'fake', 'click here']  # Basic list
+        if any(kw in text.lower() for kw in spam_keywords):
+            return False
+        return True
+
+    def check_rate_limit(self, user_id: int, target_id: int) -> bool:
+        """
+        Check global per-user rate limit (~20 messages/minute to unique users).
+        Returns True if allowed, False if rate limited.
+        """
+        if not self.enable_compliance:
+            return True
+        now = time.time()
+        user_deque = self._rate_tracking[user_id]
+        # Remove old timestamps (>1 minute)
+        while user_deque and now - user_deque[0] > 60:
+            user_deque.popleft()
+        if len(user_deque) >= self.global_rate_limit_per_minute:
+            return False
+        user_deque.append(now)
+        return True
+
+    def log_violation(self, event_type: str, details: Dict):
+        """
+        Log compliance violation to DB and logger.
+        """
+        ts = datetime.now().isoformat()
+        details_str = json.dumps(details)
+        self.db.execute("INSERT INTO compliance_logs (ts, event_type, details) VALUES (?, ?, ?)", (ts, event_type, details_str))
+        logger.warning(f"Compliance violation: {event_type} - {details}")
+
+    def alert(self, message: str):
+        """
+        Show alert via GUI popup or log.
+        """
+        if self.gui_app:
+            messagebox.showwarning("Compliance Alert", message)
+        logger.error(f"Compliance Alert: {message}")
+
+    def check_and_forward(self, user_id: int, target_id: int, message) -> bool:
+        """
+        Perform all compliance checks before forwarding.
+        Returns True if allowed, False otherwise.
+        """
+        if not self.enable_compliance:
+            return True
+        if not self.validate_content(message):
+            self.log_violation("content_violation", {"user_id": user_id, "message_id": getattr(message, 'id', None), "text": getattr(message, 'text', '')[:100]})
+            self.alert("Message content violates compliance rules.")
+            return False
+        if not self.check_rate_limit(user_id, target_id):
+            self.log_violation("rate_limit_exceeded", {"user_id": user_id, "target_id": target_id})
+            self.alert("Rate limit exceeded for user.")
+            return False
+        return True
 
 # -------------------------
 # Account / Session manager
@@ -404,17 +511,20 @@ async def _async_delete_forwarded_in_groups(client: TelegramClient, group_list: 
 # Section 2: ForwardEngine
 # -------------------------
 class ForwardEngine:
-    def __init__(self, client: TelegramClient, dbm: DBManager, history_obj=None, defaults=None, source_entity=None, target_entities=None):
+    def __init__(self, client: TelegramClient, dbm: DBManager, history_obj=None, defaults=None, source_entity=None, target_entities=None, compliance_mgr=None, user_id=None, gui_app=None):
         self.client = client
         self.db = dbm
         self.history = history_obj
         self.source_entity = source_entity
         self.target_entities = target_entities or []
+        self.compliance_mgr = compliance_mgr
+        self.user_id = user_id
+        self.gui_app = gui_app
         if defaults is None:
             self.defaults = {
-                "batch_size": int(self.db.get_setting("batch_size", "10")),
-                "per_forward_delay": float(self.db.get_setting("per_forward_delay", "1.0")),
-                "cooldown_minutes": int(self.db.get_setting("cooldown_minutes", "1"))
+                "batch_size": MSG_QUEUE_MAXSIZE,
+                "per_forward_delay": float(self.db.get_setting("per_forward_delay", "2.0")),
+                "cooldown_minutes": 0
             }
         else:
             self.defaults = defaults
@@ -424,10 +534,18 @@ class ForwardEngine:
         self._load_last_sent_from_db()
 
         # queue for messages: each item is (source_entity, message_obj, target_entities, options)
-        self.queue: "Queue[Tuple]" = Queue(maxsize=MSG_QUEUE_MAXSIZE)
+        self.queue = asyncio.Queue(maxsize=MSG_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Future] = None
         self._running = False
         self._handler = None
+        self.total_running_time = float(self.db.get_setting("total_running_time", "0.0"))
+        self.last_update_time = None
+        self.last_time_based_cooldown = time.time()
+        self._repeat_messages = []
+
+    def shuffle_targets(self):
+        random.shuffle(self.target_entities)
+        logger.info("Target entities shuffled to new order")
 
     def _load_last_sent_from_db(self):
         try:
@@ -487,6 +605,17 @@ class ForwardEngine:
             logger.exception("Error checking default topic for %s", getattr(entity, 'title', str(entity)))
         return None
 
+    async def _check_account_banned(self) -> bool:
+        try:
+            await self.client.get_me()
+            return False
+        except errors.UserDeactivatedBanError:
+            logger.error("Account is banned by Telegram")
+            return True
+        except Exception as e:
+            logger.debug("Error checking account status: %s", e)
+            return False
+
     async def _delete_last_forwarded_if_exists(self, target_entity):
         title = getattr(target_entity, 'title', str(getattr(target_entity, 'id', target_entity)))
         rec = self._last_sent.get(title)
@@ -503,11 +632,24 @@ class ForwardEngine:
         except Exception as e:
             logger.warning("Could not delete previous msg %s in %s: %s", last_msg_id, title, e)
 
+    async def _ensure_connected(self):
+        if not self.client.is_connected():
+            try:
+                await self.client.connect()
+                logger.debug("Reconnected to Telegram")
+            except Exception as e:
+                logger.error("Failed to reconnect: %s", e)
+                raise
+
     async def _forward_to_target(self, source_entity, message_obj, target_entity, options: Dict):
+        await self._ensure_connected()
         title = getattr(target_entity, 'title', str(getattr(target_entity, 'id', target_entity)))
         can_post = await self._can_post_to(target_entity)
         if not can_post:
             logger.info("Skipping %s because posting permission not available", title)
+            return False, None
+
+        if self.compliance_mgr and not self.compliance_mgr.check_and_forward(self.user_id, getattr(target_entity, 'id', None), message_obj):
             return False, None
 
         slow_secs = await self._get_slowmode_seconds(target_entity)
@@ -568,6 +710,17 @@ class ForwardEngine:
             logger.warning("Flood wait encountered: sleeping %ss", wait)
             await asyncio.sleep(wait + 1)
             return False, None
+        except errors.ChatWriteForbiddenError:
+            logger.warning("Cannot write to %s, skipping", title)
+            return False, None
+        except errors.ChatRestrictedError:
+            logger.warning("Chat %s is restricted, skipping", title)
+            return False, None
+        except errors.SlowModeWaitError as e:
+            wait = getattr(e, 'seconds', None) or 30
+            logger.warning("Slow mode wait for %s: sleeping %ss", title, wait)
+            await asyncio.sleep(wait + 1)
+            return False, None
         except Exception as e:
             logger.exception("Unexpected error forwarding to %s: %s", title, e)
             return False, None
@@ -622,32 +775,57 @@ class ForwardEngine:
         self.db.execute("DELETE FROM queued_messages")
 
     async def _on_new_message(self, event):
-        message = event.message
-        # Enqueue the new message for forwarding
-        self.enqueue(self.source_entity, message, self.target_entities, {})
+        try:
+            message = event.message
+            # Enqueue the new message for forwarding
+            self.enqueue(self.source_entity, message, self.target_entities, {})
+        except Exception as e:
+            logger.exception("Error in _on_new_message: %s", e)
 
     async def _worker(self):
         logger.info("ForwardEngine worker started")
         while self._running:
-            try:
-                item = await asyncio.get_event_loop().run_in_executor(None, lambda: self.queue.get(True, 0.5))
-            except Exception:
-                await asyncio.sleep(0.1)
-                continue
-            if not item:
-                continue
+            # Check if account is banned
+            if await self._check_account_banned():
+                logger.error("Account is banned, stopping forward engine")
+                self._running = False
+                break
+            # Check for time-based cooldown every 2 hours
+            current_time = time.time()
+            if current_time - self.last_time_based_cooldown >= 2 * 3600:
+                logger.info("Time-based cooldown: cooling down for 1 hour")
+                await asyncio.sleep(3600)
+                self.last_time_based_cooldown = time.time()
+            # If queue is empty and we have repeat messages, re-enqueue them
+            if self.queue.empty() and self._repeat_messages:
+                for msg in self._repeat_messages:
+                    try:
+                        self.queue.put_nowait(msg)
+                    except asyncio.QueueFull:
+                        break
+            item = await self.queue.get()
             source_entity, message_obj, target_entities, options = item
             batch = options.get('batch_size', self.defaults.get('batch_size', 6))
             cooldown = options.get('cooldown_minutes', self.defaults.get('cooldown_minutes', 1))
             sent_count = 0
             try:
-                for tgt in target_entities:
+                # Use the randomized target order set at initialization
+                randomized_targets = target_entities
+                for tgt in randomized_targets:
                     if not self._running:
                         break
                     ok, sent_id = await self._forward_to_target(source_entity, message_obj, tgt, options)
                     if ok:
                         sent_count += 1
-                    await asyncio.sleep(self.defaults.get('per_forward_delay', 0.8))
+                    # Randomized delay between 0.5 to 2.0 times the base delay to simulate human typing/reading
+                    base_delay = self.defaults.get('per_forward_delay', 0.8)
+                    randomized_delay = random.uniform(0.5 * base_delay, 2.0 * base_delay)
+                    await asyncio.sleep(randomized_delay)
+                    # Occasional longer pause (10% chance) to simulate human breaks
+                    if random.random() < 0.1:
+                        long_pause = random.uniform(5, 15)  # 5-15 seconds
+                        logger.debug(f"Simulating human break: pausing for {long_pause:.1f}s")
+                        await asyncio.sleep(long_pause)
                     if sent_count >= batch:
                         if cooldown:
                             logger.info("Batch complete — cooling down for %d minutes", cooldown)
@@ -660,13 +838,17 @@ class ForwardEngine:
                     self.queue.task_done()
                 except Exception:
                     pass
+            # Add processed item to repeat messages if not already present
+            if item not in self._repeat_messages:
+                self._repeat_messages.append(item)
         logger.info("ForwardEngine worker stopped")
 
     def start(self, loop=None):
         if self._running:
             return
+        self.last_update_time = time.time()
         self._running = True
-        self._handler = self.client.add_event_handler(events.NewMessage, self._on_new_message)
+        self._handler = self.client.add_event_handler(events.NewMessage(chats=self.source_entity), self._on_new_message)
         loop = loop or asyncio.get_event_loop()
         self._worker_task = loop.create_task(self._worker())
 
@@ -681,6 +863,11 @@ class ForwardEngine:
             except Exception:
                 pass
             self._worker_task = None
+        if self.last_update_time is not None:
+            elapsed = time.time() - self.last_update_time
+            self.total_running_time += elapsed
+            self.db.set_setting("total_running_time", str(self.total_running_time))
+            self.last_update_time = None
 
 # -------------------------
 # Section 3: GUI (TelegramForwarderApp)
@@ -689,6 +876,7 @@ class TelegramForwarderApp:
     def __init__(self):
         self.account_mgr = account_mgr
         self.db = db
+        self.compliance_mgr = ComplianceManager(self.db, self)
         self.forward_engines: Dict[str, ForwardEngine] = {}
 
         self.current_phone: Optional[str] = None
@@ -775,10 +963,21 @@ class TelegramForwarderApp:
         ttk.Button(frm, text='Delete Forwarded', command=self.on_delete_forwarded).grid(row=6, column=1)
         ttk.Button(frm, text='Undo Deleted', command=self.on_undo_deleted).grid(row=6, column=2)
         ttk.Button(frm, text='Settings', command=self.on_settings).grid(row=6, column=3)
+        ttk.Button(frm, text='Shuffle Targets', command=self.on_shuffle_targets).grid(row=6, column=4)
 
         ttk.Label(frm, text='Log:').grid(row=7, column=0, sticky='w')
         self.log_text = tk.Text(frm, height=12, width=100, state=tk.DISABLED)
         self.log_text.grid(row=8, column=0, columnspan=4, pady=(4,0))
+
+        # Progress bar for queue status
+        ttk.Label(frm, text='Queue Progress:').grid(row=9, column=0, sticky='w')
+        self.progress_var = tk.IntVar()
+        self.progress_bar = ttk.Progressbar(frm, variable=self.progress_var, maximum=MSG_QUEUE_MAXSIZE)
+        self.progress_bar.grid(row=9, column=1, columnspan=2, sticky='ew', pady=(4,0))
+
+        # Status label
+        self.status_label = ttk.Label(frm, text='Status: Stopped')
+        self.status_label.grid(row=10, column=0, columnspan=4, sticky='w', pady=(4,0))
 
     def log(self, msg: str, level=logging.INFO):
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -980,7 +1179,19 @@ class TelegramForwarderApp:
         async def start_eng():
             if not self.current_client.is_connected():
                 await self.current_client.connect()
-            eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None, source_entity=source_ent, target_entities=targets)
+            eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None, source_entity=source_ent, target_entities=targets, compliance_mgr=self.compliance_mgr, user_id=self.current_user_id, gui_app=self)
+            # Queue up to 6 existing messages from source before starting
+            count = 0
+            async for m in self.current_client.iter_messages(source_ent, limit=100):
+                if not isinstance(source_ent, Channel) and self.current_user_id is not None and getattr(m, 'sender_id', None) != self.current_user_id:
+                    continue
+                if self.compliance_mgr and not self.compliance_mgr.check_and_forward(self.current_user_id, None, m):
+                    continue
+                ok = eng.enqueue(source_ent, m, targets, {'batch_size': eng.defaults.get('batch_size', 6), 'cooldown_minutes': eng.defaults.get('cooldown_minutes', 1)})
+                if ok:
+                    count += 1
+                if count >= MSG_QUEUE_MAXSIZE:
+                    break
             eng.start(self.loop)
             if self.forward_queued_on_start:
                 await eng.load_queued()
@@ -1026,7 +1237,7 @@ class TelegramForwarderApp:
 
         async def gather_and_enqueue():
             try:
-                count = 0
+                messages = []
                 async for m in self.current_client.iter_messages(source_ent, limit=100):
                     if not isinstance(source_ent, Channel) and self.current_user_id is not None and getattr(m, 'sender_id', None) != self.current_user_id:
                         continue
@@ -1034,16 +1245,23 @@ class TelegramForwarderApp:
                         continue
                     if attach_only and not getattr(m, 'media', None):
                         continue
-                    if self.current_phone not in self.forward_engines or not self.forward_engines[self.current_phone]._running:
-                        eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None)
-                        eng.start(self.loop)
-                        self.forward_engines[self.current_phone] = eng
+                    if self.compliance_mgr and not self.compliance_mgr.check_and_forward(self.current_user_id, None, m):
+                        continue
+                    messages.append(m)
+                    if len(messages) >= MSG_QUEUE_MAXSIZE:
+                        break
+                # Randomize the order of messages to mimic human-like behavior
+                random.shuffle(messages)
+                count = 0
+                if self.current_phone not in self.forward_engines or not self.forward_engines[self.current_phone]._running:
+                    eng = ForwardEngine(self.current_client, self.db, history_obj=ForwardingHistory(), defaults=None)
+                    eng.start(self.loop)
+                    self.forward_engines[self.current_phone] = eng
+                for m in messages:
                     ok = self.forward_engines[self.current_phone].enqueue(source_ent, m, targets, { 'batch_size': self.forward_engines[self.current_phone].defaults.get('batch_size', 6), 'cooldown_minutes': self.forward_engines[self.current_phone].defaults.get('cooldown_minutes', 1) })
                     if ok:
                         count += 1
-                    if count >= MSG_QUEUE_MAXSIZE:
-                        break
-                self.log(f'Queued {count} messages for forwarding')
+                self.log(f'Queued {count} messages for forwarding (randomized order)')
                 messagebox.showinfo('Queued', f'Queued {count} messages for forwarding')
             except Exception as e:
                 logger.exception('Error collecting messages: %s', e)
@@ -1135,6 +1353,14 @@ class TelegramForwarderApp:
         self.db.set_setting("cooldown_minutes", str(cooldown_minutes_int))
         self.log(f'Settings updated: batch_size={batch_size_int}, per_forward_delay={per_forward_delay_float}, cooldown_minutes={cooldown_minutes_int}')
         messagebox.showinfo('Settings', 'Settings saved successfully')
+
+    def on_shuffle_targets(self):
+        if self.current_phone not in self.forward_engines or not self.forward_engines[self.current_phone]._running:
+            messagebox.showinfo('Not running', 'Forwarding engine is not running')
+            return
+        self.forward_engines[self.current_phone].shuffle_targets()
+        self.log('Targets shuffled')
+        messagebox.showinfo('Shuffled', 'Target order has been shuffled')
 
     def _restore_deleted_messages_slow(self, group_title):
         async def do_restore():
